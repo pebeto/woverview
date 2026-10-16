@@ -1,0 +1,73 @@
+name: Release
+
+# Every push to master, which normally means merging develop into it, is a
+# new version: tested, built, tagged and published with the executable.
+#
+# The version lives in the tags. The first release uses the one in
+# Cargo.toml; after that, the commits since the last tag decide the next
+# one (see .github/scripts/next-version). CI writes it into Cargo.toml only
+# for the build, so the executable reports it, and never commits back.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The whole history with tags, to find the last version.
+          fetch-depth: 0
+
+      - name: Work out the version
+        id: version
+        run: |
+          last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -z "$last" ]; then
+            version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f 2)
+          else
+            version=$(git log --format='%s%n%b' "$last..HEAD" | bash .github/scripts/next-version "$last")
+          fi
+          echo "Releasing $version, after ${last:-nothing}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpango1.0-dev libcairo2-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Stamp the version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          cargo update --workspace
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="woverview-$VERSION-x86_64-linux"
+          cp target/release/woverview "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          gh release create "v$VERSION" "$asset" "$asset.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes

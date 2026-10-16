@@ -1,6 +1,7 @@
 [package]
 name = "woverview"
 version = "0.1.0"
+edition = "2024"
 description = "A macOS-style overview of every open window, for sway"
 
 [dependencies]

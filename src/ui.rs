@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::channel::Sender as LoopSender;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -40,7 +40,8 @@ use wayland_client::protocol::wl_shm;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, QueueHandle, delegate_noop};
+use wayland_client::protocol::wl_callback::{self, WlCallback};
+use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1;
 use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_v1::WpAlphaModifierV1;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1};
@@ -71,6 +72,9 @@ const LABEL_GAP: u32 = 10;
 /// closing while still opening, take a share of it.
 const OPEN_TIME: f64 = 0.25;
 const CLOSE_TIME: f64 = 0.2;
+/// How long to wait for the compositor to say a frame went out before
+/// taking the next animation step anyway.
+pub const FRAME_DEADLINE: Duration = Duration::from_millis(100);
 /// How long the thumbnail of a window that closes takes to fade out, in seconds.
 const GONE_TIME: f64 = 0.2;
 /// How small a window that fades in starts out, next to its slot size.
@@ -313,6 +317,9 @@ pub struct Ui {
     progress: f64,
     animation: Option<Animation>,
     last_frame: Option<Instant>,
+    /// The frame we asked the compositor about, by number, and when.
+    frame_wanted: Option<(u64, Instant)>,
+    frames_asked: u64,
     configured: bool,
     waited_enough: bool,
     pub done: bool,
@@ -432,6 +439,8 @@ impl Ui {
             progress: 0.0,
             animation: None,
             last_frame: None,
+            frame_wanted: None,
+            frames_asked: 0,
             configured: false,
             waited_enough: false,
             done: false,
@@ -743,9 +752,26 @@ impl Ui {
     }
 
     /// Tells the compositor where everything goes at the current progress.
+    ///
+    /// While something moves, it also asks for the next frame. The compositor
+    /// only answers for surfaces that show, and the backdrop doesn't when a
+    /// thumbnail covers it whole, as a fullscreen window's does at the start
+    /// of the opening. So every picture asks too, and the first answer counts.
     fn render(&mut self) {
         let p = self.progress;
         let now = Instant::now();
+        let moving = self.animation.is_some() || self.thumbs.iter().any(|t| t.closed.is_some() && !t.hidden);
+        let ask = (moving && self.frame_wanted.is_none()).then(|| {
+            self.frames_asked += 1;
+            self.frame_wanted = Some((self.frames_asked, now));
+            self.frames_asked
+        });
+        let qh = self.qh.clone();
+        let ask_for_frame = |surface: &WlSurface| {
+            if let Some(number) = ask {
+                surface.frame(&qh, FrameAsked(number));
+            }
+        };
         self.backdrop.alpha.set_multiplier(multiplier(BACKDROP_ALPHA * p));
         let mut selected_rect = None;
         let mut faded = Vec::new();
@@ -762,6 +788,7 @@ impl Ui {
                 Some(anchor) => (lerp(anchor, thumb.slot, p), presence),
                 None => (scale_about_center(thumb.slot, FADE_SCALE + (1.0 - FADE_SCALE) * p), p * presence),
             };
+            ask_for_frame(&thumb.picture.surface);
             thumb.picture.place(rect, opacity);
             // Real windows have square corners, so the rounding comes in
             // with progress, as the backdrop does.
@@ -791,17 +818,38 @@ impl Ui {
         if let Some(rect) = selected_rect {
             let ring = RING as f64;
             let around = Rect { x: rect.x - ring, y: rect.y - ring, width: rect.width + 2.0 * ring, height: rect.height + 2.0 * ring };
+            ask_for_frame(&self.ring.surface);
             self.ring.place(around, p);
         }
         for i in faded {
             self.thumbs[i].hide();
         }
-        let fading = self.thumbs.iter().any(|t| t.closed.is_some() && !t.hidden);
         let root = self.layer.wl_surface();
-        if self.animation.is_some() || fading {
-            root.frame(&self.qh, FrameCallbackData(root.clone()));
-        }
+        ask_for_frame(root);
         root.commit();
+    }
+
+    /// A frame we asked about went out. Answers from surfaces asked about an
+    /// earlier frame, or from more than one surface, count once.
+    fn frame_done(&mut self, number: u64) {
+        if self.frame_wanted.is_some_and(|(wanted, _)| wanted == number) {
+            self.frame_wanted = None;
+            self.tick();
+        }
+    }
+
+    /// Runs every so often while the overview is up. If the compositor never
+    /// answers about a frame, which it doesn't for surfaces nobody can see,
+    /// the animation still moves on, so the overview can't get stuck holding
+    /// the keyboard.
+    pub fn watchdog(&mut self) {
+        if let Some((number, asked)) = self.frame_wanted
+            && asked.elapsed() >= FRAME_DEADLINE
+        {
+            debug!("no answer about frame {number} after {} ms; moving on", asked.elapsed().as_millis());
+            self.frame_wanted = None;
+            self.tick();
+        }
     }
 
     fn relayout(&mut self) {
@@ -1004,9 +1052,8 @@ fn scale_about_center(rect: Rect, scale: f64) -> Rect {
 impl CompositorHandler for Ui {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {
-        self.tick();
-    }
+    // Frames are asked for with `FrameAsked`, which arrives below.
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {}
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &WlOutput) {}
 }
@@ -1149,6 +1196,17 @@ impl ProvidesRegistryState for Ui {
 
 delegate_registry!(Ui);
 delegate_dispatch2!(Ui);
+
+/// Which frame a frame callback was asked for.
+struct FrameAsked(u64);
+
+impl Dispatch<WlCallback, FrameAsked> for Ui {
+    fn event(ui: &mut Self, _: &WlCallback, event: wl_callback::Event, asked: &FrameAsked, _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_callback::Event::Done { .. } = event {
+            ui.frame_done(asked.0);
+        }
+    }
+}
 
 delegate_noop!(Ui: ignore WlBuffer);
 delegate_noop!(Ui: WlShmPool);

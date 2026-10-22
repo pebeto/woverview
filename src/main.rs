@@ -238,6 +238,10 @@ fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Err
         ui.stop_waiting();
         TimeoutAction::Drop
     })?;
+    handle.insert_source(Timer::from_duration(ui::FRAME_DEADLINE), |_, _, ui| {
+        ui.watchdog();
+        TimeoutAction::ToDuration(ui::FRAME_DEADLINE / 4)
+    })?;
 
     window_events.set_nonblocking(true)?;
     let mut pending = Vec::new();

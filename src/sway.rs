@@ -6,7 +6,12 @@ use std::os::unix::net::UnixStream;
 use serde_json::Value;
 
 const RUN_COMMAND: u32 = 0;
+const SUBSCRIBE: u32 = 2;
 const GET_TREE: u32 = 4;
+/// Sway marks event messages with the high bit; this one is about windows.
+const WINDOW_EVENT: u32 = 0x8000_0003;
+/// "i3-ipc", then the payload length and the message type.
+const HEADER: usize = 14;
 const SCRATCHPAD: &str = "__i3_scratch";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -84,21 +89,54 @@ impl Ipc {
         }
     }
 
+    /// Turns this connection into a feed of window events, for
+    /// `closed_windows` to read.
+    pub fn subscribe_to_windows(mut self) -> io::Result<UnixStream> {
+        let reply = self.request(SUBSCRIBE, r#"["window"]"#)?;
+        match reply["success"].as_bool() {
+            Some(true) => Ok(self.0),
+            _ => Err(io::Error::other(format!("sway won't report window events: {reply}"))),
+        }
+    }
+
     fn request(&mut self, kind: u32, payload: &str) -> io::Result<Value> {
-        let mut message = Vec::with_capacity(14 + payload.len());
+        let mut message = Vec::with_capacity(HEADER + payload.len());
         message.extend_from_slice(b"i3-ipc");
         message.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
         message.extend_from_slice(&kind.to_ne_bytes());
         message.extend_from_slice(payload.as_bytes());
         self.0.write_all(&message)?;
 
-        let mut header = [0; 14];
+        let mut header = [0; HEADER];
         self.0.read_exact(&mut header)?;
         let length = u32::from_ne_bytes(header[6..10].try_into().unwrap());
         let mut body = vec![0; length as usize];
         self.0.read_exact(&mut body)?;
         serde_json::from_slice(&body).map_err(io::Error::other)
     }
+}
+
+/// Takes every complete message off the front of `pending`, bytes read from
+/// a connection `subscribe_to_windows` set up, and returns the windows they
+/// say closed, by `con_id`. A message cut short stays for the next read.
+pub fn closed_windows(pending: &mut Vec<u8>) -> Vec<i64> {
+    let mut closed = Vec::new();
+    while pending.len() >= HEADER {
+        let length = u32::from_ne_bytes(pending[6..10].try_into().unwrap()) as usize;
+        let kind = u32::from_ne_bytes(pending[10..14].try_into().unwrap());
+        if pending.len() < HEADER + length {
+            break;
+        }
+        let message: Vec<u8> = pending.drain(..HEADER + length).collect();
+        if kind == WINDOW_EVENT
+            && let Ok(event) = serde_json::from_slice::<Value>(&message[HEADER..])
+            && event["change"] == "close"
+            && let Some(id) = event["container"]["id"].as_i64()
+        {
+            closed.push(id);
+        }
+    }
+    closed
 }
 
 #[derive(Default)]
@@ -173,4 +211,32 @@ fn window(node: &Value, workspace: &str, focused: bool) -> Window {
 fn rect(value: &Value) -> Rect {
     let number = |key: &str| value[key].as_f64().unwrap_or_default();
     Rect { x: number("x"), y: number("y"), width: number("width"), height: number("height") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(kind: u32, body: &str) -> Vec<u8> {
+        let mut message = b"i3-ipc".to_vec();
+        message.extend_from_slice(&(body.len() as u32).to_ne_bytes());
+        message.extend_from_slice(&kind.to_ne_bytes());
+        message.extend_from_slice(body.as_bytes());
+        message
+    }
+
+    #[test]
+    fn picks_closed_windows_out_of_the_event_stream() {
+        let mut pending = message(WINDOW_EVENT, r#"{"change": "focus", "container": {"id": 7}}"#);
+        pending.extend(message(WINDOW_EVENT, r#"{"change": "close", "container": {"id": 42}}"#));
+        pending.extend(message(0x8000_0000, r#"{"change": "close", "current": {"id": 3}}"#));
+        let late = message(WINDOW_EVENT, r#"{"change": "close", "container": {"id": 9}}"#);
+        // The last message comes in two reads.
+        pending.extend(&late[..20]);
+        assert_eq!(closed_windows(&mut pending), [42]);
+        assert_eq!(pending.len(), 20, "the half message waits for the rest");
+        pending.extend(&late[20..]);
+        assert_eq!(closed_windows(&mut pending), [9]);
+        assert!(pending.is_empty());
+    }
 }

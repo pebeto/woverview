@@ -72,6 +72,8 @@ const LABEL_GAP: u32 = 10;
 /// closing while still opening, take a share of it.
 const OPEN_TIME: f64 = 0.25;
 const CLOSE_TIME: f64 = 0.2;
+/// How long the thumbnail of a window that closes takes to fade out, in seconds.
+const GONE_TIME: f64 = 0.2;
 /// How small a window that fades in starts out, next to its slot size.
 const FADE_SCALE: f64 = 0.85;
 /// The faintest anything gets, rather than fully clear, so the compositor
@@ -180,9 +182,34 @@ struct Thumb {
     label_buffer: Option<WlBuffer>,
     /// The width the title was last asked for at.
     label_width: u32,
+    /// When sway said the window closed. From then on its thumbnail fades
+    /// out and nothing can click, select or wait for it.
+    closed: Option<Instant>,
+    /// Faded out and taken off the screen.
+    hidden: bool,
 }
 
 impl Thumb {
+    /// How much of the thumbnail is left while it fades out after its
+    /// window closed: 1 while the window is open, down to 0.
+    fn presence(&self, now: Instant) -> f64 {
+        match self.closed {
+            None => 1.0,
+            Some(at) => (1.0 - (now - at).as_secs_f64() / GONE_TIME).max(0.0),
+        }
+    }
+
+    /// Takes the thumbnail, its corners and its title off the screen.
+    fn hide(&mut self) {
+        let pieces = std::iter::once(&self.picture).chain(&self.corners).chain(std::iter::once(&self.label));
+        for piece in pieces {
+            piece.surface.attach(None, 0, 0);
+            piece.surface.commit();
+        }
+        self.content = Content::Nothing;
+        self.hidden = true;
+    }
+
     /// The size the layout works with: the window's width on screen, and the
     /// shape of what we captured. A client on a hidden workspace may not
     /// have redrawn since sway resized it, so the two can disagree, and
@@ -364,6 +391,8 @@ impl Ui {
                 label: new_piece(),
                 label_buffer: None,
                 label_width: 0,
+                closed: None,
+                hidden: false,
             });
         }
         let thumbs = made.into_iter().map(Option::unwrap).collect();
@@ -417,10 +446,51 @@ impl Ui {
         self.close(None);
     }
 
+    /// Sway says this window closed. Its thumbnail fades out; if it was
+    /// selected, the nearest one left takes over; and once every window is
+    /// gone, so is the overview.
+    pub fn window_closed(&mut self, con_id: i64) {
+        let Some(index) = self.thumbs.iter().position(|t| t.window.con_id == con_id && t.closed.is_none()) else {
+            return;
+        };
+        debug!("window {con_id} closed");
+        self.thumbs[index].closed = Some(Instant::now());
+        if self.thumbs.iter().all(|t| t.closed.is_some()) {
+            self.close(None);
+            return;
+        }
+        if self.selected == Some(index) {
+            self.selected = self.nearest_to(index);
+            if self.phase != Phase::Waiting {
+                self.draw_ring();
+            }
+        }
+        match self.phase {
+            Phase::Waiting => self.start_if_ready(),
+            Phase::Opening | Phase::Open | Phase::Closing => self.render(),
+            Phase::Closed => {}
+        }
+    }
+
+    /// The open window whose thumbnail sits closest to this one's.
+    fn nearest_to(&self, index: usize) -> Option<usize> {
+        let (cx, cy) = self.thumbs[index].slot.center();
+        let distance = |thumb: &Thumb| {
+            let (x, y) = thumb.slot.center();
+            (x - cx).hypot(y - cy)
+        };
+        self.thumbs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.closed.is_none())
+            .min_by(|(_, a), (_, b)| distance(a).total_cmp(&distance(b)))
+            .map(|(i, _)| i)
+    }
+
     /// The opening has waited long enough for windows on screen.
     pub fn stop_waiting(&mut self) {
         if self.phase == Phase::Waiting {
-            let late = self.thumbs.iter().filter(|t| t.home.is_some() && t.content.size().is_none()).count();
+            let late = self.thumbs.iter().filter(|t| t.home.is_some() && t.content.size().is_none() && t.closed.is_none()).count();
             debug!("stopped waiting for {late} windows on screen");
         }
         self.waited_enough = true;
@@ -429,7 +499,8 @@ impl Ui {
 
     /// Shows a new capture of a window.
     pub fn frame_arrived(&mut self, frame: Frame) {
-        let Some(index) = self.thumbs.iter().position(|t| t.window.identifier == frame.identifier) else {
+        // A frame can still be on its way when the window closes.
+        let Some(index) = self.thumbs.iter().position(|t| t.window.identifier == frame.identifier && t.closed.is_none()) else {
             return;
         };
         let size_before = self.thumbs[index].natural_size();
@@ -481,7 +552,7 @@ impl Ui {
         let Some(thumb) = self.thumbs.get_mut(label.index) else {
             return;
         };
-        if label.width != thumb.label_width {
+        if label.width != thumb.label_width || thumb.closed.is_some() {
             return;
         }
         let Ok(buffer) = static_buffer(&self.shm, &label.image, &self.qh) else {
@@ -497,7 +568,7 @@ impl Ui {
     }
 
     fn start_if_ready(&mut self) {
-        let arrived = self.thumbs.iter().all(|t| t.home.is_none() || t.content.size().is_some());
+        let arrived = self.thumbs.iter().all(|t| t.home.is_none() || t.content.size().is_some() || t.closed.is_some());
         if self.phase == Phase::Waiting && self.configured && (arrived || self.waited_enough) {
             self.start_opening();
         }
@@ -505,7 +576,11 @@ impl Ui {
 
     fn start_opening(&mut self) {
         debug!("opening");
-        for thumb in &self.thumbs {
+        for thumb in &mut self.thumbs {
+            if thumb.closed.is_some() {
+                thumb.hide();
+                continue;
+            }
             show(thumb, &self.placeholder, None);
             for (piece, buffer) in thumb.corners.iter().zip(&self.corner_buffers) {
                 piece.show(buffer, None);
@@ -583,6 +658,8 @@ impl Ui {
     fn tick(&mut self) {
         let now = Instant::now();
         let Some(running) = self.animation.as_mut() else {
+            // Only a closed window's thumbnail fading out.
+            self.render();
             return;
         };
         // The first frame of the opening is where the compositor takes in
@@ -641,9 +718,13 @@ impl Ui {
             return;
         };
         for index in 0..self.thumbs.len() {
-            let Content::Shared { map, width, height, stride, format, .. } = &self.thumbs[index].content else {
+            let thumb = &self.thumbs[index];
+            let Content::Shared { map, width, height, stride, format, .. } = &thumb.content else {
                 continue;
             };
+            if thumb.closed.is_some() {
+                continue;
+            }
             let shrunk = Shrunk::new(map, *width, *height, *stride, *format, factor);
             let format = shrunk.format();
             let Some(buffer) = self.pooled(shrunk.width, shrunk.height, shrunk.width * 4, format, &shrunk.pixels) else {
@@ -660,12 +741,22 @@ impl Ui {
     /// Tells the compositor where everything goes at the current progress.
     fn render(&mut self) {
         let p = self.progress;
+        let now = Instant::now();
         self.backdrop.alpha.set_multiplier(multiplier(BACKDROP_ALPHA * p));
         let mut selected_rect = None;
+        let mut faded = Vec::new();
         for (i, thumb) in self.thumbs.iter().enumerate() {
+            if thumb.hidden {
+                continue;
+            }
+            let presence = thumb.presence(now);
+            if presence <= 0.0 {
+                faded.push(i);
+                continue;
+            }
             let (rect, opacity) = match thumb.anchor {
-                Some(anchor) => (lerp(anchor, thumb.slot, p), 1.0),
-                None => (scale_about_center(thumb.slot, FADE_SCALE + (1.0 - FADE_SCALE) * p), p),
+                Some(anchor) => (lerp(anchor, thumb.slot, p), presence),
+                None => (scale_about_center(thumb.slot, FADE_SCALE + (1.0 - FADE_SCALE) * p), p * presence),
             };
             thumb.picture.place(rect, opacity);
             // Real windows have square corners, so the rounding comes in
@@ -698,8 +789,12 @@ impl Ui {
             let around = Rect { x: rect.x - ring, y: rect.y - ring, width: rect.width + 2.0 * ring, height: rect.height + 2.0 * ring };
             self.ring.place(around, p);
         }
+        for i in faded {
+            self.thumbs[i].hide();
+        }
+        let fading = self.thumbs.iter().any(|t| t.closed.is_some() && !t.hidden);
         let root = self.layer.wl_surface();
-        if self.animation.is_some() {
+        if self.animation.is_some() || fading {
             root.frame(&self.qh, FrameCallbackData(root.clone()));
         }
         root.commit();
@@ -773,13 +868,15 @@ impl Ui {
     }
 
     fn thumb_at(&self, x: f64, y: f64) -> Option<usize> {
-        self.thumbs.iter().position(|t| t.slot.contains(x, y))
+        self.thumbs.iter().position(|t| t.closed.is_none() && t.slot.contains(x, y))
     }
 
     /// Moves the selection to the nearest thumbnail in direction (dx, dy).
     fn step(&mut self, dx: f64, dy: f64) {
         let Some(current) = self.selected else {
-            self.select(0);
+            if let Some(first) = self.thumbs.iter().position(|t| t.closed.is_none()) {
+                self.select(first);
+            }
             return;
         };
         let (cx, cy) = self.thumbs[current].slot.center();
@@ -787,6 +884,7 @@ impl Ui {
             .thumbs
             .iter()
             .enumerate()
+            .filter(|(_, thumb)| thumb.closed.is_none())
             .filter_map(|(i, thumb)| {
                 let (x, y) = thumb.slot.center();
                 let (vx, vy) = (x - cx, y - cy);
@@ -801,16 +899,17 @@ impl Ui {
         }
     }
 
+    /// Moves the selection `offset` thumbnails along, skipping closed windows.
     fn cycle(&mut self, offset: isize) {
         let len = self.thumbs.len() as isize;
-        if len == 0 {
-            return;
+        let mut next = self.selected.map_or(if offset > 0 { -1 } else { 0 }, |i| i as isize);
+        for _ in 0..len {
+            next = (next + offset).rem_euclid(len);
+            if self.thumbs[next as usize].closed.is_none() {
+                self.select(next as usize);
+                return;
+            }
         }
-        let next = match self.selected {
-            Some(current) => (current as isize + offset).rem_euclid(len),
-            None => 0,
-        };
-        self.select(next as usize);
     }
 
     fn key(&mut self, keysym: Keysym) {

@@ -8,7 +8,7 @@ mod shrink;
 mod sway;
 mod ui;
 
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -175,6 +175,9 @@ fn claim() -> io::Result<Claim> {
 }
 
 fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Error>> {
+    // Listen for windows closing before reading the list, so one that
+    // closes in between still gets reported.
+    let window_events = sway::Ipc::connect()?.subscribe_to_windows()?;
     let snapshot = sway::Ipc::connect()?.snapshot()?;
     let windows: Vec<_> = snapshot
         .windows
@@ -227,6 +230,29 @@ fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Err
     handle.insert_source(Timer::from_duration(FRAME_WAIT), |_, _, ui| {
         ui.stop_waiting();
         TimeoutAction::Drop
+    })?;
+
+    window_events.set_nonblocking(true)?;
+    let mut pending = Vec::new();
+    handle.insert_source(Generic::new(window_events, Interest::READ, Mode::Level), move |_, events, ui| {
+        let mut events: &UnixStream = events;
+        let mut chunk = [0; 4096];
+        loop {
+            match events.read(&mut chunk) {
+                Ok(0) => return Ok(PostAction::Remove),
+                Ok(read) => pending.extend_from_slice(&chunk[..read]),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                // Losing track of closed windows isn't worth closing over.
+                Err(err) => {
+                    eprintln!("woverview: stopped hearing about windows: {err}");
+                    return Ok(PostAction::Remove);
+                }
+            }
+        }
+        for con_id in sway::closed_windows(&mut pending) {
+            ui.window_closed(con_id);
+        }
+        Ok(PostAction::Continue)
     })?;
 
     let listener = socket.listener.try_clone()?;

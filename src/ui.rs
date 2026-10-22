@@ -51,7 +51,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use crate::capture::{Control, Damage, Frame, Pixels, bytes_per_pixel};
 use crate::debug::debug;
 use crate::layout::{self, Rect};
-use crate::paint::{self, Image};
+use crate::paint::{self, Font, Image};
 use crate::shrink::Shrunk;
 use crate::sway::{self, Window};
 
@@ -64,8 +64,7 @@ const MAX_SCALE: f64 = 0.8;
 /// Corner radius and selection ring width, in logical pixels.
 const RADIUS: u32 = 12;
 const RING: u32 = 4;
-/// The title line under each thumbnail, and the gap above and below it.
-const LABEL_LINE: u32 = 24;
+/// The gap above and below the title line under each thumbnail.
 const LABEL_GAP: u32 = 10;
 
 /// How long a full open or close takes, in seconds. Partial ones, like
@@ -251,6 +250,7 @@ pub struct LabelJob {
     workspace: String,
     title: String,
     width: u32,
+    height: u32,
     scale: f64,
 }
 
@@ -262,11 +262,11 @@ pub struct Label {
 
 /// Draws titles on a thread of its own: setting up fonts takes a moment,
 /// and the opening shouldn't wait for it.
-pub fn spawn_painter(results: LoopSender<Label>) -> mpsc::Sender<LabelJob> {
+pub fn spawn_painter(results: LoopSender<Label>, font: Font) -> mpsc::Sender<LabelJob> {
     let (jobs, queue) = mpsc::channel::<LabelJob>();
     std::thread::spawn(move || {
         for job in queue {
-            let image = paint::label(&job.workspace, &job.title, job.width, LABEL_LINE, job.scale);
+            let image = paint::label(&job.workspace, &job.title, &font, job.width, job.height, job.scale);
             if results.send(Label { index: job.index, width: job.width, image }).is_err() {
                 return;
             }
@@ -304,6 +304,8 @@ pub struct Ui {
     scale: f64,
     control: Control,
     painter: mpsc::Sender<LabelJob>,
+    /// How tall the title line is, in logical pixels.
+    label_line: u32,
 
     selected: Option<usize>,
     picked: Option<usize>,
@@ -324,6 +326,7 @@ impl Ui {
         snapshot: &sway::Snapshot,
         control: Control,
         painter: mpsc::Sender<LabelJob>,
+        font: &Font,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let compositor = CompositorState::bind(globals, qh)?;
         let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), globals, qh)?;
@@ -422,6 +425,7 @@ impl Ui {
             scale,
             control,
             painter,
+            label_line: font.line_height(),
             selected,
             picked: None,
             phase: Phase::Waiting,
@@ -777,7 +781,7 @@ impl Ui {
                 x: rect.x + (rect.width - label_width) / 2.0,
                 y: rect.y + rect.height + LABEL_GAP as f64,
                 width: label_width,
-                height: LABEL_LINE as f64,
+                height: self.label_line as f64,
             };
             thumb.label.place(label, opacity * ((p - 0.6) / 0.4).clamp(0.0, 1.0));
             if self.selected == Some(i) {
@@ -807,7 +811,7 @@ impl Ui {
         }
         let margin = (height * MARGIN).round();
         let area = Rect { x: margin, y: margin, width: width - 2.0 * margin, height: height - 2.0 * margin };
-        let label_height = (LABEL_GAP + LABEL_LINE + LABEL_GAP) as f64;
+        let label_height = (LABEL_GAP + self.label_line + LABEL_GAP) as f64;
         let params = layout::Params { spacing: (height * SPACING).round(), label_height, max_scale: MAX_SCALE };
         let sizes: Vec<_> = self.thumbs.iter().map(Thumb::natural_size).collect();
         let rects = layout::arrange(&sizes, area, &params);
@@ -828,6 +832,7 @@ impl Ui {
                         title => title.to_owned(),
                     },
                     width,
+                    height: self.label_line,
                     scale: self.scale,
                 };
                 let _ = self.painter.send(job);

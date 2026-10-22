@@ -6,9 +6,58 @@ use std::f64::consts::{FRAC_PI_2, PI};
 
 use cairo::{Context, Format, ImageSurface};
 
-/// Titles use the desktop's default sans font at this size, in logical pixels.
-const FONT_SIZE: f64 = 15.0;
+/// Titles without a size given come out this big, in logical pixels.
+const DEFAULT_SIZE: f64 = 15.0;
+/// Pango, like sway, puts 96 pixels in an inch, and 72 points.
+const PIXELS_PER_POINT: f64 = 96.0 / 72.0;
+/// How tall a line of titles is, next to the size of its text.
+const LINE_SPACING: f64 = 1.6;
 const TEXT: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.92);
+
+/// The font window titles are set in.
+#[derive(Clone, Debug)]
+pub struct Font(String);
+
+impl Font {
+    /// Takes a Pango font description the way sway's `font` option does,
+    /// `pango:` prefix and all: "JuliaMono 15" is 15 points, as in sway,
+    /// and "JuliaMono 20px" is 20 pixels. Without a size, it's 15 pixels.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let text = text.strip_prefix("pango:").unwrap_or(text).trim();
+        if text.is_empty() {
+            return Err("--font needs a font, like \"Sans 11\"".to_owned());
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    fn description(&self) -> pango::FontDescription {
+        let mut description = pango::FontDescription::from_string(&self.0);
+        if description.size() <= 0 {
+            description.set_absolute_size(DEFAULT_SIZE * pango::SCALE as f64);
+        }
+        description
+    }
+
+    /// The text's size in logical pixels.
+    fn pixels(&self) -> f64 {
+        let description = self.description();
+        let size = description.size() as f64 / pango::SCALE as f64;
+        if description.is_size_absolute() { size } else { size * PIXELS_PER_POINT }
+    }
+
+    /// How tall a line of titles is, in logical pixels. It comes from the
+    /// size alone, so laying the overview out doesn't wait for fonts to load.
+    pub fn line_height(&self) -> u32 {
+        (self.pixels() * LINE_SPACING).ceil() as u32
+    }
+}
+
+impl Default for Font {
+    fn default() -> Self {
+        Self("Sans".to_owned())
+    }
+}
 
 /// Premultiplied pixels, bytes B, G, R, A: `wl_shm` `Argb8888`.
 pub struct Image {
@@ -26,12 +75,10 @@ impl Image {
 /// A thumbnail's title line: its workspace, dimmed, then the window title,
 /// centered and cut short to fit. Sizes are logical; `scale` is how many
 /// pixels the output has per logical pixel.
-pub fn label(workspace: &str, title: &str, width: u32, height: u32, scale: f64) -> Image {
+pub fn label(workspace: &str, title: &str, font: &Font, width: u32, height: u32, scale: f64) -> Image {
     paint(width, height, scale, |cr| {
         let layout = pangocairo::functions::create_layout(cr);
-        let mut font = pango::FontDescription::from_string("Sans");
-        font.set_absolute_size(FONT_SIZE * pango::SCALE as f64);
-        layout.set_font_description(Some(&font));
+        layout.set_font_description(Some(&font.description()));
         layout.set_markup(&format!(
             "<span alpha=\"60%\">{}</span>   {}",
             pango::glib::markup_escape_text(workspace),
@@ -131,8 +178,19 @@ mod tests {
     }
 
     #[test]
+    fn font_sizes_read_like_sway_reads_them() {
+        // 15 points at 96 per inch is 20 pixels; lines are 1.6 times that.
+        assert_eq!(Font::parse("JuliaMono 15").unwrap().line_height(), 32);
+        assert_eq!(Font::parse("pango:JuliaMono Regular 10").unwrap().line_height(), 22);
+        assert_eq!(Font::parse("Sans 20px").unwrap().line_height(), 32);
+        assert_eq!(Font::parse("Sans").unwrap().line_height(), Font::default().line_height());
+        assert_eq!(Font::default().line_height(), 24);
+        assert!(Font::parse("  pango:  ").is_err());
+    }
+
+    #[test]
     fn labels_come_out_at_the_output_scale() {
-        let image = label("3", "A window", 200, 30, 1.5);
+        let image = label("3", "A window", &Font::default(), 200, 30, 1.5);
         assert_eq!((image.width, image.height), (300, 45));
         assert!(image.pixels.chunks(4).any(|p| p[3] > 0), "no text drawn");
     }

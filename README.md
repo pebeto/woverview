@@ -42,4 +42,5 @@ Options:
 
 - `--current` shows only the focused workspace.
 - `--fps N` limits how often thumbnails refresh (default 30). `--fps 0` keeps them still.
+- `--font FONT` sets the font for window titles, written like sway's `font` option: `--font "JuliaMono 15"` (default: Sans at 15 px).
 - `--close` closes the overview if it's open.

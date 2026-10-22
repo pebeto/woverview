@@ -24,6 +24,7 @@ use wayland_client::globals::registry_queue_init;
 
 use crate::capture::{Control, Target};
 use crate::debug::debug;
+use crate::paint::Font;
 use crate::ui::Ui;
 
 const DEFAULT_FPS: u32 = 30;
@@ -32,7 +33,7 @@ const DEFAULT_FPS: u32 = 30;
 /// gray box in its place.
 const FRAME_WAIT: Duration = Duration::from_millis(150);
 const HELP: &str = "\
-Usage: woverview [--current] [--fps N] [--close]
+Usage: woverview [--current] [--fps N] [--font FONT] [--close]
 
 Shows every open window as a thumbnail, including the ones on other
 workspaces and in the scratchpad. Click one, or move with the arrow keys
@@ -46,6 +47,8 @@ Options:
   -c, --current   only show windows on the focused workspace
       --fps N     redraw a thumbnail at most N times a second when its
                   window changes (default 30); 0 keeps them still
+      --font FONT font for window titles, like \"JuliaMono 15\", in points
+                  as in sway's font option (default: Sans at 15 px)
       --close     close the overview if it is open; never open it
   -h, --help      print this help
   -V, --version   print the version
@@ -55,6 +58,7 @@ struct Options {
     current: bool,
     close: bool,
     fps: u32,
+    font: Font,
 }
 
 enum Parsed {
@@ -64,7 +68,7 @@ enum Parsed {
 }
 
 fn parse(args: &[String]) -> Result<Parsed, String> {
-    let mut options = Options { current: false, close: false, fps: DEFAULT_FPS };
+    let mut options = Options { current: false, close: false, fps: DEFAULT_FPS, font: Font::default() };
     let mut args = args.iter().map(String::as_str);
     while let Some(arg) = args.next() {
         match arg {
@@ -74,6 +78,8 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--close" => options.close = true,
             "--fps" => options.fps = parse_fps(args.next())?,
             _ if arg.starts_with("--fps=") => options.fps = parse_fps(arg.strip_prefix("--fps="))?,
+            "--font" => options.font = Font::parse(args.next().unwrap_or_default())?,
+            _ if arg.starts_with("--font=") => options.font = Font::parse(&arg["--font=".len()..])?,
             _ => return Err(format!("unknown option '{arg}'")),
         }
     }
@@ -204,7 +210,8 @@ fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Err
     // thread how small to make frames.
     let (labels, label_source) = channel::channel();
     let control = Control::default();
-    let mut ui = Ui::new(&globals, &queue.handle(), windows, &snapshot, control.clone(), ui::spawn_painter(labels))?;
+    let painter = ui::spawn_painter(labels, options.font.clone());
+    let mut ui = Ui::new(&globals, &queue.handle(), windows, &snapshot, control.clone(), painter, &options.font)?;
     WaylandSource::new(connection, queue).insert(handle.clone()).map_err(|err| err.error)?;
     handle.insert_source(label_source, |event, _, ui| {
         if let Event::Msg(label) = event {

@@ -82,10 +82,20 @@ impl Ipc {
     }
 
     pub fn focus(&mut self, con_id: i64) -> io::Result<()> {
-        let reply = self.request(RUN_COMMAND, &format!("[con_id={con_id}] focus"))?;
+        self.command(&format!("[con_id={con_id}] focus"))
+    }
+
+    /// Asks the window to close, as sway's `kill` does. The app may still
+    /// ask the user first, or refuse.
+    pub fn close(&mut self, con_id: i64) -> io::Result<()> {
+        self.command(&format!("[con_id={con_id}] kill"))
+    }
+
+    fn command(&mut self, command: &str) -> io::Result<()> {
+        let reply = self.request(RUN_COMMAND, command)?;
         match reply[0]["success"].as_bool() {
             Some(true) => Ok(()),
-            _ => Err(io::Error::other(format!("sway refused to focus window {con_id}: {reply}"))),
+            _ => Err(io::Error::other(format!("sway refused '{command}': {reply}"))),
         }
     }
 

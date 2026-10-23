@@ -122,6 +122,32 @@ pub fn corner(corner: usize, radius: u32, color: (f64, f64, f64), scale: f64) ->
     })
 }
 
+/// The close button a hovered thumbnail shows, as macOS does: a light disc
+/// with a dark cross, outlined so it reads on light windows too. It's a
+/// little darker while the pointer is on it.
+pub fn close_button(size: u32, hot: bool, scale: f64) -> Image {
+    paint(size, size, scale, |cr| {
+        let r = size as f64 / 2.0;
+        cr.arc(r, r, r - 1.0, 0.0, 2.0 * PI);
+        let fill = if hot { 0.76 } else { 0.92 };
+        cr.set_source_rgb(fill, fill, fill);
+        let _ = cr.fill_preserve();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+
+        let arm = r * 0.36;
+        cr.move_to(r - arm, r - arm);
+        cr.line_to(r + arm, r + arm);
+        cr.move_to(r + arm, r - arm);
+        cr.line_to(r - arm, r + arm);
+        cr.set_source_rgb(0.15, 0.15, 0.15);
+        cr.set_line_width((r * 0.16).max(1.5));
+        cr.set_line_cap(cairo::LineCap::Round);
+        let _ = cr.stroke();
+    })
+}
+
 fn rounded_rect(cr: &Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
     let r = radius.max(0.0).min(width / 2.0).min(height / 2.0);
     cr.new_sub_path();
@@ -159,6 +185,17 @@ mod tests {
 
     fn alpha(image: &Image, x: u32, y: u32) -> u8 {
         image.pixels[(y * image.stride() + x * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn close_button_is_a_disc_with_a_cross() {
+        let image = close_button(28, false, 1.0);
+        let pixel = |x: u32, y: u32| &image.pixels[(y * image.stride() + x * 4) as usize..][..4];
+        assert_eq!(pixel(0, 0)[3], 0, "outside the disc stays clear");
+        assert!(pixel(14, 14)[0] < 80, "the cross runs through the middle");
+        assert!(pixel(14, 4)[0] > 200, "the disc around it is light");
+        let hot = close_button(28, true, 1.0);
+        assert!(hot.pixels[(4 * hot.stride() + 14 * 4) as usize] < pixel(14, 4)[0], "darker under the pointer");
     }
 
     #[test]

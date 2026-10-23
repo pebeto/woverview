@@ -37,8 +37,9 @@ Usage: woverview [--current] [--fps N] [--font FONT] [--close]
 
 Shows every open window as a thumbnail, including the ones on other
 workspaces and in the scratchpad. Click one, or move with the arrow keys
-(or hjkl, or Tab) and press Enter, to focus it. Escape or a click on the
-background closes the overview.
+(or hjkl, or Tab) and press Enter, to focus it. To close a window, click
+the button on its thumbnail's corner, or middle-click the thumbnail.
+Escape or a click on the background closes the overview.
 
 Running woverview while the overview is open closes it, so one binding
 can toggle it.

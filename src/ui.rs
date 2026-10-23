@@ -65,6 +65,10 @@ const MAX_SCALE: f64 = 0.8;
 /// Corner radius and selection ring width, in logical pixels.
 const RADIUS: u32 = 12;
 const RING: u32 = 4;
+/// The close button on a hovered thumbnail: its size, and how far it sticks
+/// out past the thumbnail's top-left corner, in logical pixels.
+const BUTTON: u32 = 28;
+const BUTTON_OUT: f64 = 8.0;
 /// The gap above and below the title line under each thumbnail.
 const LABEL_GAP: u32 = 10;
 
@@ -300,6 +304,15 @@ pub struct Ui {
     ring: Piece,
     /// The ring as last drawn, and the size it was drawn for.
     ring_image: Option<((u32, u32), PoolBuffer)>,
+    /// The close button, and how it looks normally and under the pointer.
+    close_button: Piece,
+    close_buffers: [WlBuffer; 2],
+    /// The thumbnail under the pointer, whether the pointer is on its close
+    /// button, and where the pointer last was.
+    hovered: Option<usize>,
+    button_hot: bool,
+    pointer_at: Option<(f64, f64)>,
+    pointer_serial: Option<u32>,
 
     /// The output's size and top-left corner, in layout coordinates, and
     /// its pixels per logical pixel.
@@ -407,6 +420,12 @@ impl Ui {
         }
         let thumbs = made.into_iter().map(Option::unwrap).collect();
         let ring = new_piece();
+        // Made last, so it sits on top of everything.
+        let close_button = new_piece();
+        let close_buffers = [
+            static_buffer(&shm, &paint::close_button(BUTTON, false, scale), qh)?,
+            static_buffer(&shm, &paint::close_button(BUTTON, true, scale), qh)?,
+        ];
 
         let mut ui = Self {
             registry: RegistryState::new(globals),
@@ -427,6 +446,12 @@ impl Ui {
             thumbs,
             ring,
             ring_image: None,
+            close_button,
+            close_buffers,
+            hovered: None,
+            button_hot: false,
+            pointer_at: None,
+            pointer_serial: None,
             size: (snapshot.focused_output_rect.width, snapshot.focused_output_rect.height),
             origin,
             scale,
@@ -468,6 +493,9 @@ impl Ui {
         };
         debug!("window {con_id} closed");
         self.thumbs[index].closed = Some(Instant::now());
+        if self.hovered == Some(index) {
+            self.hover(None, false);
+        }
         if self.thumbs.iter().all(|t| t.closed.is_some()) {
             self.close(None);
             return;
@@ -482,6 +510,81 @@ impl Ui {
             Phase::Waiting => self.start_if_ready(),
             Phase::Opening | Phase::Open | Phase::Closing => self.render(),
             Phase::Closed => {}
+        }
+    }
+
+    /// Where a thumbnail's close button goes: over its top-left corner.
+    fn button_rect(&self, index: usize) -> Rect {
+        let slot = self.thumbs[index].slot;
+        Rect { x: slot.x - BUTTON_OUT, y: slot.y - BUTTON_OUT, width: BUTTON as f64, height: BUTTON as f64 }
+    }
+
+    /// The thumbnail whose close button shows: the hovered one, once the
+    /// overview is open.
+    fn button_for(&self) -> Option<usize> {
+        self.hovered.filter(|&i| self.phase == Phase::Open && self.thumbs[i].closed.is_none())
+    }
+
+    fn on_button(&self, x: f64, y: f64) -> bool {
+        let Some(index) = self.button_for() else {
+            return false;
+        };
+        let (cx, cy) = self.button_rect(index).center();
+        (x - cx).hypot(y - cy) <= BUTTON as f64 / 2.0
+    }
+
+    fn pointer_moved(&mut self, x: f64, y: f64) {
+        self.pointer_at = Some((x, y));
+        if !self.interactive() {
+            return;
+        }
+        // The button sticks out past its thumbnail's corner, so that
+        // thumbnail stays hovered while the pointer is on the button.
+        let hot = self.on_button(x, y);
+        let hovered = if hot { self.hovered } else { self.thumb_at(x, y) };
+        if let Some(i) = hovered {
+            self.select(i);
+        }
+        self.hover(hovered, hot);
+    }
+
+    /// Notes which thumbnail the pointer is over, and whether it's on that
+    /// thumbnail's close button, and shows the button to match.
+    fn hover(&mut self, hovered: Option<usize>, hot: bool) {
+        if (hovered, hot) == (self.hovered, self.button_hot) {
+            return;
+        }
+        if hot != self.button_hot
+            && let (Some(cursor), Some(serial)) = (&self.cursor, self.pointer_serial)
+        {
+            cursor.set_shape(serial, if hot { Shape::Pointer } else { Shape::Default });
+        }
+        self.hovered = hovered;
+        self.button_hot = hot;
+        self.show_button();
+    }
+
+    fn show_button(&mut self) {
+        match self.button_for() {
+            Some(index) => {
+                self.close_button.show(&self.close_buffers[self.button_hot as usize], None);
+                self.close_button.place(self.button_rect(index), 1.0);
+            }
+            None => {
+                self.close_button.surface.attach(None, 0, 0);
+                self.close_button.surface.commit();
+            }
+        }
+        self.layer.wl_surface().commit();
+    }
+
+    /// Asks sway to close a window. Its thumbnail fades out once sway says
+    /// the window is gone, so one whose app asks first, or refuses, stays.
+    fn close_window(&mut self, index: usize) {
+        let con_id = self.thumbs[index].window.con_id;
+        debug!("asking window {con_id} to close");
+        if let Err(err) = sway::Ipc::connect().and_then(|mut ipc| ipc.close(con_id)) {
+            eprintln!("woverview: {err}");
         }
     }
 
@@ -627,6 +730,7 @@ impl Ui {
         }
         self.picked = picked;
         self.control.pause(true);
+        self.show_button();
 
         let destination = picked.map(|i| self.thumbs[i].window.workspace.clone());
         for (i, thumb) in self.thumbs.iter_mut().enumerate() {
@@ -712,6 +816,10 @@ impl Ui {
                 debug!("open");
                 self.phase = Phase::Open;
                 self.sharpen();
+                if let Some((x, y)) = self.pointer_at {
+                    self.pointer_moved(x, y);
+                }
+                self.show_button();
                 self.control.pause(false);
             }
             Phase::Closing => {
@@ -823,6 +931,9 @@ impl Ui {
         }
         for i in faded {
             self.thumbs[i].hide();
+        }
+        if let Some(index) = self.button_for() {
+            self.close_button.place(self.button_rect(index), 1.0);
         }
         let root = self.layer.wl_surface();
         ask_for_frame(root);
@@ -1157,21 +1268,30 @@ impl PointerHandler for Ui {
     fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlPointer, events: &[PointerEvent]) {
         const BUTTON_LEFT: u32 = 0x110;
         const BUTTON_RIGHT: u32 = 0x111;
+        const BUTTON_MIDDLE: u32 = 0x112;
         for event in events {
             let (x, y) = event.position;
             match event.kind {
                 PointerEventKind::Enter { serial } => {
+                    self.pointer_serial = Some(serial);
                     if let Some(cursor) = &self.cursor {
                         cursor.set_shape(serial, Shape::Default);
                     }
+                    self.pointer_moved(x, y);
                 }
-                PointerEventKind::Motion { .. } if self.interactive() => {
-                    if let Some(i) = self.thumb_at(x, y) {
-                        self.select(i);
-                    }
+                PointerEventKind::Leave { .. } => {
+                    self.pointer_at = None;
+                    self.hover(None, false);
                 }
+                PointerEventKind::Motion { .. } => self.pointer_moved(x, y),
                 PointerEventKind::Release { button, .. } if self.interactive() => match (button, self.thumb_at(x, y)) {
+                    (BUTTON_LEFT, _) if self.on_button(x, y) => {
+                        if let Some(i) = self.hovered {
+                            self.close_window(i);
+                        }
+                    }
                     (BUTTON_LEFT, Some(i)) => self.close(Some(i)),
+                    (BUTTON_MIDDLE, Some(i)) => self.close_window(i),
                     (BUTTON_LEFT | BUTTON_RIGHT, None) => self.close(None),
                     _ => {}
                 },

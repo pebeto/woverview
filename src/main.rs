@@ -25,6 +25,7 @@ use wayland_client::globals::registry_queue_init;
 use crate::capture::{Control, Target};
 use crate::debug::debug;
 use crate::paint::Font;
+use crate::sway::WindowEvent;
 use crate::ui::Ui;
 
 const DEFAULT_FPS: u32 = 30;
@@ -182,16 +183,13 @@ fn claim() -> io::Result<Claim> {
 }
 
 fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Error>> {
-    // Listen for windows closing before reading the list, so one that
-    // closes in between still gets reported.
+    // Listen for windows opening and closing before reading the list, so
+    // one that does in between still gets reported.
     let window_events = sway::Ipc::connect()?.subscribe_to_windows()?;
     let snapshot = sway::Ipc::connect()?.snapshot()?;
-    let windows: Vec<_> = snapshot
-        .windows
-        .iter()
-        .filter(|w| !options.current || Some(&w.workspace) == snapshot.focused_workspace.as_ref())
-        .cloned()
-        .collect();
+    let (current, focused_workspace) = (options.current, snapshot.focused_workspace.clone());
+    let wanted = move |w: &sway::Window| !current || Some(&w.workspace) == focused_workspace.as_ref();
+    let windows: Vec<_> = snapshot.windows.iter().filter(|w| wanted(w)).cloned().collect();
     debug!("{} windows from sway", windows.len());
     if windows.is_empty() {
         return Ok(());
@@ -221,14 +219,19 @@ fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Err
     })?;
 
     // Capture on a worker thread; thumbnails arrive while the overlay gets
-    // ready, then keep up with their windows.
+    // ready, then keep up with their windows. Windows that open later get a
+    // thread of their own.
     let live = (options.fps > 0).then(|| Duration::from_secs_f64(1.0 / options.fps as f64));
     let (frames, frame_source) = channel::sync_channel(ui.thumb_count() * 2);
-    std::thread::spawn(move || {
-        if let Err(err) = capture::capture(&targets, live, &control, |frame| frames.try_send(frame)) {
-            eprintln!("woverview: can't capture windows: {err}");
-        }
-    });
+    let start_capture = move |targets: Vec<Target>| {
+        let (frames, control) = (frames.clone(), control.clone());
+        std::thread::spawn(move || {
+            if let Err(err) = capture::capture(&targets, live, &control, |frame| frames.try_send(frame)) {
+                eprintln!("woverview: can't capture windows: {err}");
+            }
+        });
+    };
+    start_capture(targets);
     handle.insert_source(frame_source, |event, _, ui| {
         if let Event::Msg(frame) = event {
             ui.frame_arrived(frame);
@@ -254,16 +257,41 @@ fn run(options: &Options, socket: &Socket) -> Result<(), Box<dyn std::error::Err
                 Ok(0) => return Ok(PostAction::Remove),
                 Ok(read) => pending.extend_from_slice(&chunk[..read]),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                // Losing track of closed windows isn't worth closing over.
+                // Losing track of windows isn't worth closing over.
                 Err(err) => {
                     eprintln!("woverview: stopped hearing about windows: {err}");
                     return Ok(PostAction::Remove);
                 }
             }
         }
-        for con_id in sway::closed_windows(&mut pending) {
-            ui.window_closed(con_id);
+        let events = sway::window_events(&mut pending);
+        if events.is_empty() {
+            return Ok(PostAction::Continue);
         }
+        for event in &events {
+            if let WindowEvent::Closed(con_id) = *event {
+                ui.window_closed(con_id);
+            }
+        }
+        // A window opening or closing moves its neighbours, and a new one
+        // needs a workspace and a size, so read the tree again.
+        let snapshot = match sway::Ipc::connect().and_then(|mut ipc| ipc.snapshot()) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                eprintln!("woverview: {err}");
+                return Ok(PostAction::Continue);
+            }
+        };
+        for event in events {
+            if let WindowEvent::New(con_id) = event
+                && let Some(window) = snapshot.windows.iter().find(|w| w.con_id == con_id && wanted(w))
+                && ui.window_opened(window.clone(), &snapshot)
+                && !window.identifier.is_empty()
+            {
+                start_capture(vec![Target { identifier: window.identifier.clone(), on_screen: false }]);
+            }
+        }
+        ui.windows_moved(&snapshot);
         Ok(PostAction::Continue)
     })?;
 

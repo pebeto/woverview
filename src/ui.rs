@@ -79,8 +79,11 @@ const CLOSE_TIME: f64 = 0.2;
 /// How long to wait for the compositor to say a frame went out before
 /// taking the next animation step anyway.
 pub const FRAME_DEADLINE: Duration = Duration::from_millis(100);
-/// How long the thumbnail of a window that closes takes to fade out, in seconds.
-const GONE_TIME: f64 = 0.2;
+/// How long the thumbnail of a window that opens or closes while the
+/// overview is up takes to fade in or out, in seconds.
+const FADE_TIME: f64 = 0.2;
+/// How long thumbnails take to slide over when the layout changes.
+const SLIDE_TIME: f64 = 0.25;
 /// How small a window that fades in starts out, next to its slot size.
 const FADE_SCALE: f64 = 0.85;
 /// The faintest anything gets, rather than fully clear, so the compositor
@@ -133,6 +136,31 @@ impl Piece {
     fn raise_above(&self, other: &WlSurface) {
         self.subsurface.place_above(other);
     }
+
+    fn lower_below(&self, other: &WlSurface) {
+        self.subsurface.place_below(other);
+    }
+}
+
+/// Makes pieces: subsurfaces of the overlay that the pointer goes through.
+struct Factory {
+    subcompositor: SubcompositorState,
+    viewporter: WpViewporter,
+    alpha: WpAlphaModifierV1,
+    empty: Region,
+    root: WlSurface,
+}
+
+impl Factory {
+    /// A new piece, on top of every other one.
+    fn piece(&self, qh: &QueueHandle<Ui>) -> Piece {
+        let (subsurface, surface) = self.subcompositor.create_subsurface(self.root.clone(), qh);
+        // Pointer events all go to the overlay itself.
+        surface.set_input_region(Some(self.empty.wl_region()));
+        let viewport = self.viewporter.get_viewport(&surface, qh, ());
+        let alpha = self.alpha.get_surface(&surface, qh, ());
+        Piece { surface, subsurface, viewport, alpha }
+    }
 }
 
 /// The root surface's own content: one pixel, stretched over the output
@@ -182,13 +210,19 @@ struct Thumb {
     anchor: Option<Rect>,
     /// Its place in the grid.
     slot: Rect,
+    /// On its way to `slot` from an earlier one, after the layout changed.
+    slide: Option<Slide>,
     picture: Piece,
     content: Content,
     corners: [Piece; 4],
     label: Piece,
-    label_buffer: Option<WlBuffer>,
+    /// The title, and the width it was drawn for.
+    label_buffer: Option<(WlBuffer, u32)>,
     /// The width the title was last asked for at.
     label_width: u32,
+    /// When the window opened, if that was while the overview was up. Its
+    /// thumbnail fades in from then.
+    born: Option<Instant>,
     /// When sway said the window closed. From then on its thumbnail fades
     /// out and nothing can click, select or wait for it.
     closed: Option<Instant>,
@@ -196,14 +230,75 @@ struct Thumb {
     hidden: bool,
 }
 
+struct Slide {
+    from: Rect,
+    start: Instant,
+}
+
 impl Thumb {
+    /// A thumbnail on top of everything, with nothing to show yet.
+    fn new(window: Window, home: Option<Rect>, factory: &Factory, qh: &QueueHandle<Ui>) -> Self {
+        Self {
+            window,
+            home,
+            anchor: home,
+            slot: Rect::default(),
+            slide: None,
+            picture: factory.piece(qh),
+            content: Content::Nothing,
+            corners: std::array::from_fn(|_| factory.piece(qh)),
+            label: factory.piece(qh),
+            label_buffer: None,
+            label_width: 0,
+            born: None,
+            closed: None,
+            hidden: false,
+        }
+    }
+
+    /// Puts the corners and title back over the picture after it moved in
+    /// the stack.
+    fn restack(&self) {
+        for corner in &self.corners {
+            corner.raise_above(&self.picture.surface);
+        }
+        self.label.raise_above(&self.corners[3].surface);
+    }
+
+    /// Where its slot is right now, which is somewhere on the way there
+    /// while it slides.
+    fn shown(&self, now: Instant) -> Rect {
+        match &self.slide {
+            Some(slide) => lerp(slide.from, self.slot, ease_out(elapsed(slide.start, now, SLIDE_TIME))),
+            None => self.slot,
+        }
+    }
+
+    /// How far the thumbnail has faded in: 1 unless its window opened while
+    /// the overview was up, and then up from 0.
+    fn arrival(&self, now: Instant) -> f64 {
+        self.born.map_or(1.0, |at| elapsed(at, now, FADE_TIME))
+    }
+
     /// How much of the thumbnail is left while it fades out after its
     /// window closed: 1 while the window is open, down to 0.
     fn presence(&self, now: Instant) -> f64 {
-        match self.closed {
-            None => 1.0,
-            Some(at) => (1.0 - (now - at).as_secs_f64() / GONE_TIME).max(0.0),
+        self.closed.map_or(1.0, |at| 1.0 - elapsed(at, now, FADE_TIME))
+    }
+
+    /// Forgets a slide or fade-in that's over.
+    fn settle(&mut self, now: Instant) {
+        if self.slide.as_ref().is_some_and(|slide| elapsed(slide.start, now, SLIDE_TIME) >= 1.0) {
+            self.slide = None;
         }
+        if self.arrival(now) >= 1.0 {
+            self.born = None;
+        }
+    }
+
+    /// Still sliding or fading in or out.
+    fn changing(&self) -> bool {
+        self.slide.is_some() || self.born.is_some() || (self.closed.is_some() && !self.hidden)
     }
 
     /// Takes the thumbnail, its corners and its title off the screen.
@@ -254,7 +349,7 @@ struct Animation {
 
 /// A title for the painter thread to draw.
 pub struct LabelJob {
-    index: usize,
+    con_id: i64,
     workspace: String,
     title: String,
     width: u32,
@@ -263,7 +358,7 @@ pub struct LabelJob {
 }
 
 pub struct Label {
-    index: usize,
+    con_id: i64,
     width: u32,
     image: Image,
 }
@@ -275,7 +370,7 @@ pub fn spawn_painter(results: LoopSender<Label>, font: Font) -> mpsc::Sender<Lab
     std::thread::spawn(move || {
         for job in queue {
             let image = paint::label(&job.workspace, &job.title, &font, job.width, job.height, job.scale);
-            if results.send(Label { index: job.index, width: job.width, image }).is_err() {
+            if results.send(Label { con_id: job.con_id, width: job.width, image }).is_err() {
                 return;
             }
         }
@@ -297,9 +392,12 @@ pub struct Ui {
     qh: QueueHandle<Ui>,
 
     layer: LayerSurface,
+    factory: Factory,
     backdrop: Backdrop,
     placeholder: WlBuffer,
     corner_buffers: Vec<WlBuffer>,
+    /// Shows nothing; sits under every thumbnail, for one to sink to.
+    floor: Piece,
     thumbs: Vec<Thumb>,
     ring: Piece,
     /// The ring as last drawn, and the size it was drawn for.
@@ -368,15 +466,8 @@ impl Ui {
         layer.commit();
         let root = layer.wl_surface().clone();
 
-        let new_piece = || {
-            let (subsurface, surface) = subcompositor.create_subsurface(root.clone(), qh);
-            // Pointer events all go to the overlay itself.
-            surface.set_input_region(Some(empty.wl_region()));
-            let viewport = viewporter.get_viewport(&surface, qh, ());
-            let alpha = alpha.get_surface(&surface, qh, ());
-            Piece { surface, subsurface, viewport, alpha }
-        };
         let backdrop = Backdrop { viewport: viewporter.get_viewport(&root, qh, ()), alpha: alpha.get_surface(&root, qh, ()) };
+        let factory = Factory { subcompositor, viewporter, alpha, empty, root };
         let channel = |v: f64| (v * u32::MAX as f64) as u32;
         let placeholder = single_pixel.create_u32_rgba_buffer(
             channel(PLACEHOLDER_ALPHA),
@@ -395,6 +486,7 @@ impl Ui {
         // Subsurfaces stack in the order they're made. Windows fading in or
         // out go at the bottom; ones coming from or going to the desktop
         // stack the way sway does, tiled under floating.
+        let floor = factory.piece(qh);
         let origin = (snapshot.focused_output_rect.x, snapshot.focused_output_rect.y);
         let selected = windows.iter().position(|w| w.focused);
         let mut order: Vec<usize> = (0..windows.len()).collect();
@@ -403,25 +495,12 @@ impl Ui {
         for i in order {
             let window = windows[i].clone();
             let home = window.visible.then(|| on_overlay(&window, origin)).flatten();
-            made[i] = Some(Thumb {
-                window,
-                home,
-                anchor: home,
-                slot: Rect::default(),
-                picture: new_piece(),
-                content: Content::Nothing,
-                corners: [new_piece(), new_piece(), new_piece(), new_piece()],
-                label: new_piece(),
-                label_buffer: None,
-                label_width: 0,
-                closed: None,
-                hidden: false,
-            });
+            made[i] = Some(Thumb::new(window, home, &factory, qh));
         }
         let thumbs = made.into_iter().map(Option::unwrap).collect();
-        let ring = new_piece();
+        let ring = factory.piece(qh);
         // Made last, so it sits on top of everything.
-        let close_button = new_piece();
+        let close_button = factory.piece(qh);
         let close_buffers = [
             static_buffer(&shm, &paint::close_button(BUTTON, false, scale), qh)?,
             static_buffer(&shm, &paint::close_button(BUTTON, true, scale), qh)?,
@@ -440,9 +519,11 @@ impl Ui {
             pointer: None,
             qh: qh.clone(),
             layer,
+            factory,
             backdrop,
             placeholder,
             corner_buffers,
+            floor,
             thumbs,
             ring,
             ring_image: None,
@@ -484,15 +565,20 @@ impl Ui {
         self.close(None);
     }
 
-    /// Sway says this window closed. Its thumbnail fades out; if it was
-    /// selected, the nearest one left takes over; and once every window is
-    /// gone, so is the overview.
+    /// Sway says this window closed. Its thumbnail fades out and the
+    /// others slide over to fill the gap; if it was selected, the nearest
+    /// one left takes over; and once every window is gone, so is the
+    /// overview.
     pub fn window_closed(&mut self, con_id: i64) {
         let Some(index) = self.thumbs.iter().position(|t| t.window.con_id == con_id && t.closed.is_none()) else {
             return;
         };
         debug!("window {con_id} closed");
-        self.thumbs[index].closed = Some(Instant::now());
+        let thumb = &mut self.thumbs[index];
+        thumb.closed = Some(Instant::now());
+        // The others slide over it while it fades.
+        thumb.picture.raise_above(&self.floor.surface);
+        thumb.restack();
         if self.hovered == Some(index) {
             self.hover(None, false);
         }
@@ -507,15 +593,82 @@ impl Ui {
             }
         }
         match self.phase {
-            Phase::Waiting => self.start_if_ready(),
-            Phase::Opening | Phase::Open | Phase::Closing => self.render(),
+            Phase::Waiting => {
+                self.relayout();
+                self.start_if_ready();
+            }
+            Phase::Opening | Phase::Open => {
+                self.relayout();
+                self.render();
+            }
+            // Everything is on its way back to the desktop.
+            Phase::Closing => self.render(),
             Phase::Closed => {}
+        }
+    }
+
+    /// A window opened while the overview is up. Its thumbnail fades in
+    /// next to the ones it comes after in sway's order, which `snapshot`
+    /// has, and the others slide aside to make room. Says whether it got a
+    /// thumbnail, which then wants pictures.
+    pub fn window_opened(&mut self, window: Window, snapshot: &sway::Snapshot) -> bool {
+        let known = self.thumbs.iter().any(|t| t.window.con_id == window.con_id && t.closed.is_none());
+        if known || matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return false;
+        }
+        debug!("window {} opened", window.con_id);
+        let rank = |con_id: i64| snapshot.windows.iter().position(|w| w.con_id == con_id);
+        let after = rank(window.con_id);
+        let index = self.thumbs.iter().position(|t| rank(t.window.con_id) > after).unwrap_or(self.thumbs.len());
+
+        let home = window.visible.then(|| on_overlay(&window, self.origin)).flatten();
+        let mut thumb = Thumb::new(window, home, &self.factory, &self.qh);
+        // It wasn't on the desktop the overview opened from, so it fades in
+        // where it goes rather than fly in from there.
+        thumb.anchor = None;
+        // New pieces land on top of everything; keep this one under the
+        // selection ring and the close button.
+        thumb.picture.lower_below(&self.ring.surface);
+        thumb.restack();
+        if self.phase != Phase::Waiting {
+            thumb.born = Some(Instant::now());
+            reveal(&thumb, &self.placeholder, &self.corner_buffers);
+        }
+        self.thumbs.insert(index, thumb);
+        for i in [&mut self.selected, &mut self.hovered].into_iter().flatten() {
+            if *i >= index {
+                *i += 1;
+            }
+        }
+        self.relayout();
+        if self.phase != Phase::Waiting {
+            self.render();
+        }
+        true
+    }
+
+    /// Sway moved windows around, as it does when one opens or closes next
+    /// to them. Notes where each one went now, from `snapshot`, so the
+    /// closing flies it to the right place, and resizes its thumbnail.
+    pub fn windows_moved(&mut self, snapshot: &sway::Snapshot) {
+        if matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return;
+        }
+        for thumb in self.thumbs.iter_mut().filter(|t| t.closed.is_none()) {
+            if let Some(window) = snapshot.windows.iter().find(|w| w.con_id == thumb.window.con_id) {
+                thumb.home = window.visible.then(|| on_overlay(window, self.origin)).flatten();
+                thumb.window = window.clone();
+            }
+        }
+        self.relayout();
+        if self.phase != Phase::Waiting {
+            self.render();
         }
     }
 
     /// Where a thumbnail's close button goes: over its top-left corner.
     fn button_rect(&self, index: usize) -> Rect {
-        let slot = self.thumbs[index].slot;
+        let slot = self.thumbs[index].shown(Instant::now());
         Rect { x: slot.x - BUTTON_OUT, y: slot.y - BUTTON_OUT, width: BUTTON as f64, height: BUTTON as f64 }
     }
 
@@ -526,9 +679,11 @@ impl Ui {
     }
 
     fn on_button(&self, x: f64, y: f64) -> bool {
-        let Some(index) = self.button_for() else {
-            return false;
-        };
+        self.button_for().is_some_and(|index| self.over_button(index, x, y))
+    }
+
+    /// Whether (x, y) is on where this thumbnail's close button goes.
+    fn over_button(&self, index: usize, x: f64, y: f64) -> bool {
         let (cx, cy) = self.button_rect(index).center();
         (x - cx).hypot(y - cy) <= BUTTON as f64 / 2.0
     }
@@ -540,8 +695,10 @@ impl Ui {
         }
         // The button sticks out past its thumbnail's corner, so that
         // thumbnail stays hovered while the pointer is on the button.
-        let hot = self.on_button(x, y);
-        let hovered = if hot { self.hovered } else { self.thumb_at(x, y) };
+        let hovered = if self.on_button(x, y) { self.hovered } else { self.thumb_at(x, y) };
+        // A thumbnail that just came under the pointer, say by sliding
+        // there, can have its button right under it too.
+        let hot = self.phase == Phase::Open && hovered.is_some_and(|i| self.over_button(i, x, y));
         if let Some(i) = hovered {
             self.select(i);
         }
@@ -606,7 +763,7 @@ impl Ui {
     /// The opening has waited long enough for windows on screen.
     pub fn stop_waiting(&mut self) {
         if self.phase == Phase::Waiting {
-            let late = self.thumbs.iter().filter(|t| t.home.is_some() && t.content.size().is_none() && t.closed.is_none()).count();
+            let late = self.thumbs.iter().filter(|t| t.anchor.is_some() && t.content.size().is_none() && t.closed.is_none()).count();
             debug!("stopped waiting for {late} windows on screen");
         }
         self.waited_enough = true;
@@ -665,26 +822,26 @@ impl Ui {
     }
 
     pub fn label_arrived(&mut self, label: Label) {
-        let Some(thumb) = self.thumbs.get_mut(label.index) else {
+        let Some(thumb) = self.thumbs.iter_mut().find(|t| t.window.con_id == label.con_id && t.closed.is_none()) else {
             return;
         };
-        if label.width != thumb.label_width || thumb.closed.is_some() {
+        if label.width != thumb.label_width {
             return;
         }
         let Ok(buffer) = static_buffer(&self.shm, &label.image, &self.qh) else {
             return;
         };
-        if let Some(old) = thumb.label_buffer.replace(buffer) {
+        if let Some((old, _)) = thumb.label_buffer.replace((buffer, label.width)) {
             old.destroy();
         }
         if self.phase != Phase::Waiting {
-            thumb.label.show(thumb.label_buffer.as_ref().unwrap(), None);
+            thumb.label.show(&thumb.label_buffer.as_ref().unwrap().0, None);
             self.render();
         }
     }
 
     fn start_if_ready(&mut self) {
-        let arrived = self.thumbs.iter().all(|t| t.home.is_none() || t.content.size().is_some() || t.closed.is_some());
+        let arrived = self.thumbs.iter().all(|t| t.anchor.is_none() || t.content.size().is_some() || t.closed.is_some());
         if self.phase == Phase::Waiting && self.configured && (arrived || self.waited_enough) {
             self.start_opening();
         }
@@ -697,13 +854,7 @@ impl Ui {
                 thumb.hide();
                 continue;
             }
-            show(thumb, &self.placeholder, None);
-            for (piece, buffer) in thumb.corners.iter().zip(&self.corner_buffers) {
-                piece.show(buffer, None);
-            }
-            if let Some(label) = &thumb.label_buffer {
-                thumb.label.show(label, None);
-            }
+            reveal(thumb, &self.placeholder, &self.corner_buffers);
         }
         self.draw_ring();
         self.phase = Phase::Opening;
@@ -743,14 +894,18 @@ impl Ui {
                 Some(_) => None,
             };
         }
+        if let Some(i) = self.selected.filter(|_| picked.is_none()) {
+            // The ring fades with the window it marks, so the ones flying
+            // over that window cover the ring too.
+            let thumb = &self.thumbs[i];
+            self.ring.raise_above(&thumb.picture.surface);
+            thumb.restack();
+        }
         if let Some(i) = picked {
             // The picked window goes on top of everything on its way.
             let thumb = &self.thumbs[i];
             thumb.picture.raise_above(&self.ring.surface);
-            for corner in &thumb.corners {
-                corner.raise_above(&thumb.picture.surface);
-            }
-            thumb.label.raise_above(&thumb.corners[3].surface);
+            thumb.restack();
             let con_id = thumb.window.con_id;
             if let Err(err) = sway::Ipc::connect().and_then(|mut ipc| ipc.focus(con_id)) {
                 eprintln!("woverview: {err}");
@@ -775,8 +930,14 @@ impl Ui {
     fn tick(&mut self) {
         let now = Instant::now();
         let Some(running) = self.animation.as_mut() else {
-            // Only a closed window's thumbnail fading out.
+            // Only thumbnails fading in or out, or sliding over.
             self.render();
+            // Once they settle, a different one may sit under the pointer.
+            if self.frame_wanted.is_none()
+                && let Some((x, y)) = self.pointer_at
+            {
+                self.pointer_moved(x, y);
+            }
             return;
         };
         // The first frame of the opening is where the compositor takes in
@@ -795,10 +956,8 @@ impl Ui {
         {
             debug!("slow frame: {:.0} ms", (now - last).as_secs_f64() * 1e3);
         }
-        let t = if running.duration > 0.0 { ((now - start).as_secs_f64() / running.duration).min(1.0) } else { 1.0 };
-        // Ease out: quick to leave, gentle to land.
-        let eased = 1.0 - (1.0 - t).powi(3);
-        self.progress = running.from + (running.to - running.from) * eased;
+        let t = elapsed(start, now, running.duration);
+        self.progress = running.from + (running.to - running.from) * ease_out(t);
         if t >= 1.0 {
             self.animation = None;
             self.last_frame = None;
@@ -868,7 +1027,10 @@ impl Ui {
     fn render(&mut self) {
         let p = self.progress;
         let now = Instant::now();
-        let moving = self.animation.is_some() || self.thumbs.iter().any(|t| t.closed.is_some() && !t.hidden);
+        for thumb in &mut self.thumbs {
+            thumb.settle(now);
+        }
+        let moving = self.animation.is_some() || self.thumbs.iter().any(Thumb::changing);
         let ask = (moving && self.frame_wanted.is_none()).then(|| {
             self.frames_asked += 1;
             self.frame_wanted = Some((self.frames_asked, now));
@@ -892,10 +1054,18 @@ impl Ui {
                 faded.push(i);
                 continue;
             }
-            let (rect, opacity) = match thumb.anchor {
-                Some(anchor) => (lerp(anchor, thumb.slot, p), presence),
-                None => (scale_about_center(thumb.slot, FADE_SCALE + (1.0 - FADE_SCALE) * p), p * presence),
+            let slot = thumb.shown(now);
+            let (mut rect, mut opacity) = match thumb.anchor {
+                Some(anchor) => (lerp(anchor, slot, p), presence),
+                None => (scale_about_center(slot, FADE_SCALE + (1.0 - FADE_SCALE) * p), p * presence),
             };
+            // A window that opened while the overview was up grows into its
+            // slot the same way.
+            let arrival = thumb.arrival(now);
+            if arrival < 1.0 {
+                rect = scale_about_center(rect, FADE_SCALE + (1.0 - FADE_SCALE) * ease_out(arrival));
+                opacity *= arrival;
+            }
             ask_for_frame(&thumb.picture.surface);
             thumb.picture.place(rect, opacity);
             // Real windows have square corners, so the rounding comes in
@@ -910,8 +1080,10 @@ impl Ui {
             for (piece, (x, y)) in thumb.corners.iter().zip(corners) {
                 piece.place(Rect { x, y, width: r, height: r }, opacity * BACKDROP_ALPHA * p);
             }
-            // Titles only come in over the last stretch, once things settle.
-            let label_width = thumb.slot.width;
+            // Titles only come in over the last stretch, once things settle,
+            // and never stretch: one drawn for an older slot keeps its width
+            // until the new one is ready.
+            let label_width = thumb.label_buffer.as_ref().map_or(slot.width, |(_, width)| *width as f64);
             let label = Rect {
                 x: rect.x + (rect.width - label_width) / 2.0,
                 y: rect.y + rect.height + LABEL_GAP as f64,
@@ -972,19 +1144,33 @@ impl Ui {
         let area = Rect { x: margin, y: margin, width: width - 2.0 * margin, height: height - 2.0 * margin };
         let label_height = (LABEL_GAP + self.label_line + LABEL_GAP) as f64;
         let params = layout::Params { spacing: (height * SPACING).round(), label_height, max_scale: MAX_SCALE };
-        let sizes: Vec<_> = self.thumbs.iter().map(Thumb::natural_size).collect();
+        // Closed windows give up their slots; their thumbnails fade out in
+        // place.
+        let open: Vec<usize> = (0..self.thumbs.len()).filter(|&i| self.thumbs[i].closed.is_none()).collect();
+        let sizes: Vec<_> = open.iter().map(|&i| self.thumbs[i].natural_size()).collect();
         let rects = layout::arrange(&sizes, area, &params);
         // Every window shrinks by the same factor, so any one of them tells it.
         if let (Some(rect), Some(size)) = (rects.first(), sizes.first()) {
             self.control.zoom.set(rect.width / size.0);
         }
-        for (index, (thumb, rect)) in self.thumbs.iter_mut().zip(rects).enumerate() {
-            thumb.slot = Rect { x: rect.x.round(), y: rect.y.round(), width: rect.width.round(), height: rect.height.round() };
-            let width = thumb.slot.width as u32;
+        let now = Instant::now();
+        for (&index, rect) in open.iter().zip(rects) {
+            let thumb = &mut self.thumbs[index];
+            let slot = Rect { x: rect.x.round(), y: rect.y.round(), width: rect.width.round(), height: rect.height.round() };
+            if slot == thumb.slot {
+                continue;
+            }
+            // Once on screen, thumbnails slide over to their new slots. A
+            // new one has no slot yet to slide from.
+            if self.phase != Phase::Waiting && thumb.slot != Rect::default() {
+                thumb.slide = Some(Slide { from: thumb.shown(now), start: now });
+            }
+            thumb.slot = slot;
+            let width = slot.width as u32;
             if width != thumb.label_width {
                 thumb.label_width = width;
                 let job = LabelJob {
-                    index,
+                    con_id: thumb.window.con_id,
                     workspace: thumb.window.workspace.clone(),
                     title: match thumb.window.title.as_str() {
                         "" => thumb.window.app_id.clone(),
@@ -1116,6 +1302,17 @@ impl Ui {
     }
 }
 
+/// Puts a thumbnail on screen: its picture, corners and title.
+fn reveal(thumb: &Thumb, placeholder: &WlBuffer, corners: &[WlBuffer]) {
+    show(thumb, placeholder, None);
+    for (piece, buffer) in thumb.corners.iter().zip(corners) {
+        piece.show(buffer, None);
+    }
+    if let Some((label, _)) = &thumb.label_buffer {
+        thumb.label.show(label, None);
+    }
+}
+
 /// Attaches whatever the thumbnail has to show, or the placeholder.
 fn show(thumb: &Thumb, placeholder: &WlBuffer, damage: Option<&[Damage]>) {
     match &thumb.content {
@@ -1148,6 +1345,20 @@ fn static_buffer(shm: &Shm, image: &Image, qh: &QueueHandle<Ui>) -> io::Result<W
 fn on_overlay(window: &Window, (x, y): (f64, f64)) -> Option<Rect> {
     let r = window.rect;
     (r.width >= 1.0 && r.height >= 1.0).then_some(Rect { x: r.x - x, y: r.y - y, width: r.width, height: r.height })
+}
+
+/// How far along something that started at `start` and takes `duration`
+/// seconds is at `now`, from 0 to 1.
+fn elapsed(start: Instant, now: Instant, duration: f64) -> f64 {
+    if duration <= 0.0 {
+        return 1.0;
+    }
+    (now.saturating_duration_since(start).as_secs_f64() / duration).min(1.0)
+}
+
+/// Quick to leave, gentle to land.
+fn ease_out(t: f64) -> f64 {
+    1.0 - (1.0 - t).powi(3)
 }
 
 fn lerp(from: Rect, to: Rect, t: f64) -> Rect {

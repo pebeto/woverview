@@ -1,4 +1,5 @@
-//! The little bit of sway IPC woverview needs: read the tree, focus a window.
+//! The little bit of sway IPC woverview needs: read the tree, focus or
+//! close a window, hear about windows opening and closing.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -63,10 +64,8 @@ impl Ipc {
         let tree = self.request(GET_TREE, "")?;
         let mut walk = Walk::default();
         walk.visit(&tree, "", "");
-        walk.windows.sort_by(|(a_ws, a), (b_ws, b)| {
-            a_ws.cmp(b_ws)
-                .then(a.rect.y.total_cmp(&b.rect.y))
-                .then(a.rect.x.total_cmp(&b.rect.x))
+        walk.windows.sort_by(|(a_ws, a, _), (b_ws, b, _)| {
+            a_ws.cmp(b_ws).then(a.y.total_cmp(&b.y)).then(a.x.total_cmp(&b.x))
         });
         let (focused_output_rect, focused_output_scale) = walk
             .outputs
@@ -74,7 +73,7 @@ impl Ipc {
             .find(|(name, ..)| Some(name) == walk.focused_output.as_ref())
             .map_or((Rect::default(), 1.0), |(_, rect, scale)| (*rect, *scale));
         Ok(Snapshot {
-            windows: walk.windows.into_iter().map(|(_, window)| window).collect(),
+            windows: walk.windows.into_iter().map(|(.., window)| window).collect(),
             focused_output_rect,
             focused_output_scale,
             focused_workspace: walk.focused_workspace,
@@ -100,7 +99,7 @@ impl Ipc {
     }
 
     /// Turns this connection into a feed of window events, for
-    /// `closed_windows` to read.
+    /// `window_events` to read.
     pub fn subscribe_to_windows(mut self) -> io::Result<UnixStream> {
         let reply = self.request(SUBSCRIBE, r#"["window"]"#)?;
         match reply["success"].as_bool() {
@@ -126,11 +125,18 @@ impl Ipc {
     }
 }
 
+/// A window opening or closing, by `con_id`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WindowEvent {
+    New(i64),
+    Closed(i64),
+}
+
 /// Takes every complete message off the front of `pending`, bytes read from
 /// a connection `subscribe_to_windows` set up, and returns the windows they
-/// say closed, by `con_id`. A message cut short stays for the next read.
-pub fn closed_windows(pending: &mut Vec<u8>) -> Vec<i64> {
-    let mut closed = Vec::new();
+/// say opened or closed. A message cut short stays for the next read.
+pub fn window_events(pending: &mut Vec<u8>) -> Vec<WindowEvent> {
+    let mut events = Vec::new();
     while pending.len() >= HEADER {
         let length = u32::from_ne_bytes(pending[6..10].try_into().unwrap()) as usize;
         let kind = u32::from_ne_bytes(pending[10..14].try_into().unwrap());
@@ -138,21 +144,32 @@ pub fn closed_windows(pending: &mut Vec<u8>) -> Vec<i64> {
             break;
         }
         let message: Vec<u8> = pending.drain(..HEADER + length).collect();
-        if kind == WINDOW_EVENT
-            && let Ok(event) = serde_json::from_slice::<Value>(&message[HEADER..])
-            && event["change"] == "close"
-            && let Some(id) = event["container"]["id"].as_i64()
-        {
-            closed.push(id);
+        if kind != WINDOW_EVENT {
+            continue;
+        }
+        let Ok(event) = serde_json::from_slice::<Value>(&message[HEADER..]) else {
+            continue;
+        };
+        let Some(id) = event["container"]["id"].as_i64() else {
+            continue;
+        };
+        match event["change"].as_str() {
+            Some("new") => events.push(WindowEvent::New(id)),
+            Some("close") => events.push(WindowEvent::Closed(id)),
+            _ => {}
         }
     }
-    closed
+    events
 }
 
 #[derive(Default)]
 struct Walk {
-    /// Each window with the position of its workspace in the tree.
-    windows: Vec<(usize, Window)>,
+    /// Each window with the position of its workspace in the tree, and
+    /// where its container is, borders and title included. Containers side
+    /// by side line up exactly; the windows inside them may not, as when
+    /// only some have a title bar, or sway hasn't put the borders around one
+    /// that just opened.
+    windows: Vec<(usize, Rect, Window)>,
     workspaces_seen: usize,
     outputs: Vec<(String, Rect, f64)>,
     focused_output: Option<String>,
@@ -185,7 +202,7 @@ impl Walk {
         if node["pid"].is_number() {
             // The scratchpad sits first in the tree. Show it last.
             let order = if workspace == SCRATCHPAD { usize::MAX } else { self.workspaces_seen };
-            self.windows.push((order, window(node, workspace, focused)));
+            self.windows.push((order, rect(&node["rect"]), window(node, workspace, focused)));
         }
 
         let children = node["nodes"].as_array().into_iter().flatten();
@@ -236,17 +253,18 @@ mod tests {
     }
 
     #[test]
-    fn picks_closed_windows_out_of_the_event_stream() {
+    fn picks_windows_opening_and_closing_out_of_the_event_stream() {
         let mut pending = message(WINDOW_EVENT, r#"{"change": "focus", "container": {"id": 7}}"#);
+        pending.extend(message(WINDOW_EVENT, r#"{"change": "new", "container": {"id": 41}}"#));
         pending.extend(message(WINDOW_EVENT, r#"{"change": "close", "container": {"id": 42}}"#));
         pending.extend(message(0x8000_0000, r#"{"change": "close", "current": {"id": 3}}"#));
         let late = message(WINDOW_EVENT, r#"{"change": "close", "container": {"id": 9}}"#);
         // The last message comes in two reads.
         pending.extend(&late[..20]);
-        assert_eq!(closed_windows(&mut pending), [42]);
+        assert_eq!(window_events(&mut pending), [WindowEvent::New(41), WindowEvent::Closed(42)]);
         assert_eq!(pending.len(), 20, "the half message waits for the rest");
         pending.extend(&late[20..]);
-        assert_eq!(closed_windows(&mut pending), [9]);
+        assert_eq!(window_events(&mut pending), [WindowEvent::Closed(9)]);
         assert!(pending.is_empty());
     }
 }
